@@ -12,21 +12,24 @@ SLOT="0"
 KEYWORDS=""
 
 KGA_REPO_URI="https://invent.kde.org/plasma/kglobalacceld.git"
+KDECORATION_REPO_URI="https://invent.kde.org/plasma/kdecoration.git"
+ECM_REPO_URI="https://invent.kde.org/frameworks/extra-cmake-modules.git"
+KCONFIG_REPO_URI="https://invent.kde.org/frameworks/kconfig.git"
+KCONFIG_FIX_COMMIT="41592ccfd9748be82c83ce98912037bffb73954e"
 
 QTMIN="6.10.0"
-KFMIN="6.26.0"
+KFMIN="6.27.0"
 PLASMA_MIN="6.7.0"
 
 PREFIX="/opt/${PN}"
 
 BDEPEND="
-	dev-build/cmake
+	>=dev-build/cmake-3.29
 	dev-build/ninja
 	dev-vcs/git
 	virtual/pkgconfig
 	dev-util/wayland-scanner
 	dev-util/vulkan-headers
-	>=kde-frameworks/extra-cmake-modules-${KFMIN}
 "
 
 COMMON_DEPEND="
@@ -133,11 +136,49 @@ src_unpack() {
 	EGIT_REPO_URI="${KGA_REPO_URI}" \
 	EGIT_CHECKOUT_DIR="${WORKDIR}/kglobalacceld" \
 		git-r3_src_unpack
+
+	# Follow current ECM Git as a build-only dependency. This avoids requiring
+	# the system ECM package to be new enough for current KConfig Git.
+	EGIT_REPO_URI="${ECM_REPO_URI}" \
+	EGIT_CHECKOUT_DIR="${WORKDIR}/extra-cmake-modules" \
+		git-r3_src_unpack
+
+	# Follow current KDecoration Git. KineticWE master uses the new
+	# KDecoration3::Style::Titled and Style::Shadow API, which is not present
+	# in the system KDecoration shipped by Plasma 6.7. Build and install a
+	# private copy under /opt/kineticwe instead of replacing the system copy.
+	EGIT_REPO_URI="${KDECORATION_REPO_URI}" \
+	EGIT_CHECKOUT_DIR="${WORKDIR}/kdecoration" \
+		git-r3_src_unpack
+
+	# Follow current KConfig Git. The compiler fix landed in
+	# KCONFIG_FIX_COMMIT; verify that the live checkout still contains it.
+	EGIT_REPO_URI="${KCONFIG_REPO_URI}" \
+	EGIT_CHECKOUT_DIR="${WORKDIR}/kconfig" \
+		git-r3_src_unpack
+
+	# A user may select git-r3's shallow clone mode, in which the historical
+	# commit object is unavailable. Check ancestry when possible and otherwise
+	# verify the corrected enum-class assignment directly in the live source.
+	if git -C "${WORKDIR}/kconfig" cat-file -e \
+		"${KCONFIG_FIX_COMMIT}^{commit}" 2>/dev/null; then
+		git -C "${WORKDIR}/kconfig" merge-base --is-ancestor \
+			"${KCONFIG_FIX_COMMIT}" HEAD \
+			|| die "live KConfig HEAD predates required compiler fix ${KCONFIG_FIX_COMMIT}"
+	elif ! grep -Fq '? "int(v)" : "v"' \
+		"${WORKDIR}/kconfig/src/kconfig_compiler/KConfigCodeGeneratorBase.cpp"; then
+		die "live KConfig checkout does not contain required compiler fix ${KCONFIG_FIX_COMMIT}"
+	fi
 }
 
 src_compile() {
-	local libdir
+	local ecm_prefix ecm_dir kdecoration_prefix kdecoration_cmake_dir kga_prefix kconfig_compiler libdir
 	libdir="$(get_libdir)"
+	ecm_prefix="${WORKDIR}/ecm-prefix"
+	ecm_dir="${ecm_prefix}/share/ECM/cmake"
+	kdecoration_prefix="${WORKDIR}/kdecoration-stage${PREFIX}"
+	kga_prefix="${WORKDIR}/kga-stage${PREFIX}"
+	kconfig_compiler="${WORKDIR}/build-kconfig/bin/kconfig_compiler_kf6"
 
 	local common_cmake_args=(
 		-G Ninja
@@ -147,11 +188,51 @@ src_compile() {
 		-DBUILD_TESTING=OFF
 	)
 
-	einfo "Building bundled kglobalacceld into temporary staging prefix"
+	einfo "Staging Extra CMake Modules from latest Git"
+	cmake \
+		-S "${WORKDIR}/extra-cmake-modules" \
+		-B "${WORKDIR}/build-ecm" \
+		-G Ninja \
+		-DCMAKE_INSTALL_PREFIX="${ecm_prefix}" \
+		-DBUILD_DOC=OFF \
+		-DBUILD_TESTING=OFF \
+		|| die "ECM configure failed"
+
+	eninja -C "${WORKDIR}/build-ecm"
+
+	cmake --install "${WORKDIR}/build-ecm" \
+		|| die "ECM staging install failed"
+
+	[[ -f "${ecm_dir}/ECMConfig.cmake" ]] || \
+		die "live ECM was not staged at ${ecm_dir}"
+
+	einfo "Building live KDecoration against staged live ECM"
+	cmake \
+		-S "${WORKDIR}/kdecoration" \
+		-B "${WORKDIR}/build-kdecoration" \
+		"${common_cmake_args[@]}" \
+		-DECM_DIR="${ecm_dir}" \
+		-DCMAKE_PREFIX_PATH="${ecm_prefix}" \
+		|| die "kdecoration configure failed"
+
+	eninja -C "${WORKDIR}/build-kdecoration"
+
+	DESTDIR="${WORKDIR}/kdecoration-stage" \
+		cmake --install "${WORKDIR}/build-kdecoration" \
+		|| die "kdecoration staging install failed"
+
+	kdecoration_cmake_dir="$(find "${kdecoration_prefix}" \
+		-type f -name KDecoration3Config.cmake -printf '%h\n' -quit)"
+	[[ -n "${kdecoration_cmake_dir}" ]] || \
+		die "live KDecoration CMake package was not staged under ${kdecoration_prefix}"
+
+	einfo "Building bundled kglobalacceld against staged live ECM"
 	cmake \
 		-S "${WORKDIR}/kglobalacceld" \
 		-B "${WORKDIR}/build-kglobalacceld" \
 		"${common_cmake_args[@]}" \
+		-DECM_DIR="${ecm_dir}" \
+		-DCMAKE_PREFIX_PATH="${ecm_prefix}" \
 		|| die "kglobalacceld configure failed"
 
 	eninja -C "${WORKDIR}/build-kglobalacceld"
@@ -160,12 +241,34 @@ src_compile() {
 		cmake --install "${WORKDIR}/build-kglobalacceld" \
 		|| die "kglobalacceld staging install failed"
 
-	einfo "Building KineticWE against staged kglobalacceld"
+	einfo "Building kconfig_compiler from latest KConfig Git against staged live ECM"
+	cmake \
+		-S "${WORKDIR}/kconfig" \
+		-B "${WORKDIR}/build-kconfig" \
+		-G Ninja \
+		-DCMAKE_BUILD_TYPE=Release \
+		-DBUILD_TESTING=OFF \
+		-DKCONFIG_USE_GUI=OFF \
+		-DKCONFIG_USE_QML=OFF \
+		-DUSE_DBUS=OFF \
+		-DECM_DIR="${ecm_dir}" \
+		-DCMAKE_PREFIX_PATH="${ecm_prefix}" \
+		|| die "kconfig_compiler configure failed"
+
+	eninja -C "${WORKDIR}/build-kconfig" kconfig_compiler
+
+	[[ -x "${kconfig_compiler}" ]] || \
+		die "kconfig_compiler was not created at ${kconfig_compiler}"
+
+	einfo "Building KineticWE against live KDecoration, staged kglobalacceld, live ECM and live KConfig compiler"
 	cmake \
 		-S "${S}" \
 		-B "${WORKDIR}/build-kineticwe" \
 		"${common_cmake_args[@]}" \
-		-DCMAKE_PREFIX_PATH="${WORKDIR}/kga-stage${PREFIX}" \
+		-DECM_DIR="${ecm_dir}" \
+		-DCMAKE_PREFIX_PATH="${kdecoration_prefix};${kga_prefix};${ecm_prefix}" \
+		-DKDecoration3_DIR="${kdecoration_cmake_dir}" \
+		-DKWIN_KCONFIG_COMPILER="${kconfig_compiler}" \
 		-DKWIN_BUILD_GLOBALSHORTCUTS=ON \
 		-DKWIN_BUILD_X11=ON \
 		|| die "kineticwe configure failed"
@@ -176,6 +279,12 @@ src_compile() {
 src_install() {
 	local libdir
 	libdir="$(get_libdir)"
+
+	# Install the matching live KDecoration runtime privately under /opt/kineticwe.
+	# The launcher puts this library ahead of the system copy in LD_LIBRARY_PATH.
+	DESTDIR="${D}" \
+		cmake --install "${WORKDIR}/build-kdecoration" \
+		|| die "kdecoration install failed"
 
 	DESTDIR="${D}" \
 		cmake --install "${WORKDIR}/build-kglobalacceld" \
@@ -408,6 +517,8 @@ EOF
 pkg_postinst() {
 	elog "KineticWE has been installed side-by-side under ${PREFIX}."
 	elog "A Wayland session entry was installed at /usr/share/wayland-sessions/kineticwe.desktop."
+	elog "This package includes a private live KDecoration runtime under ${PREFIX}; the system KDecoration package is unchanged."
 	elog "This package starts KineticWE and attempts to launch Noctalia plus required KDE user services."
 	elog "If dependency resolution fails, you probably need newer Qt/KF/Plasma packages, likely ~amd64 or the KDE overlay."
 }
+
