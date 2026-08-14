@@ -10,6 +10,7 @@ HOMEPAGE="https://gitlab.com/theblackdon/kineticwe"
 LICENSE="GPL-2+ LGPL-2+ MIT BSD CC0-1.0"
 SLOT="0"
 KEYWORDS=""
+IUSE="+plasma-clean-env"
 
 KGA_REPO_URI="https://invent.kde.org/plasma/kglobalacceld.git"
 KDECORATION_REPO_URI="https://invent.kde.org/plasma/kdecoration.git"
@@ -511,6 +512,80 @@ EOF
 	insinto /usr/share/wayland-sessions
 	doins "${T}/kineticwe.desktop"
 
+	if use plasma-clean-env; then
+		# KineticWE intentionally exports its private /opt runtime into the
+		# per-user systemd environment.  A later stock Plasma login may inherit
+		# those values because the user manager can outlive the graphical
+		# session.  Install a separate Plasma entry which sanitizes only the
+		# KineticWE-specific environment before invoking stock Plasma.
+		cat > "${T}/startplasma-wayland-kineticwe-clean" <<'PLASMA_CLEAN_LAUNCHER'
+#!/usr/bin/env bash
+set -e
+
+KINETICWE_PREFIX="/opt/kineticwe"
+
+# These variables are ABI-sensitive.  They must not reach stock KWin/Qt.
+unset LD_LIBRARY_PATH
+unset QT_PLUGIN_PATH
+unset QML2_IMPORT_PATH
+
+# Remove only KineticWE's private bin directory; preserve all other PATH
+# customizations inherited from the login environment.
+clean_path=""
+old_ifs="${IFS}"
+IFS=:
+for entry in ${PATH:-}; do
+	[[ -z "${entry}" || "${entry}" == "${KINETICWE_PREFIX}/bin" ]] && continue
+	clean_path+="${clean_path:+:}${entry}"
+done
+IFS="${old_ifs}"
+export PATH="${clean_path:-/usr/local/bin:/usr/bin:/bin}"
+
+# Likewise remove only KineticWE's private data prefix rather than replacing
+# the user's complete XDG_DATA_DIRS.
+clean_xdg_data_dirs=""
+old_ifs="${IFS}"
+IFS=:
+for entry in ${XDG_DATA_DIRS:-/usr/local/share:/usr/share}; do
+	[[ -z "${entry}" || "${entry}" == "${KINETICWE_PREFIX}/share" ]] && continue
+	clean_xdg_data_dirs+="${clean_xdg_data_dirs:+:}${entry}"
+done
+IFS="${old_ifs}"
+export XDG_DATA_DIRS="${clean_xdg_data_dirs:-/usr/local/share:/usr/share}"
+
+# The systemd user manager is shared across graphical sessions and may retain
+# KineticWE's private runtime after logging out of KineticWE.  Remove those
+# variables there as well before Plasma starts user units.
+systemctl --user unset-environment \
+	LD_LIBRARY_PATH \
+	QT_PLUGIN_PATH \
+	QML2_IMPORT_PATH \
+	PATH \
+	XDG_DATA_DIRS 2>/dev/null || true
+
+systemctl --user set-environment \
+	PATH="${PATH}" \
+	XDG_DATA_DIRS="${XDG_DATA_DIRS}" 2>/dev/null || true
+
+exec /usr/bin/startplasma-wayland "$@"
+PLASMA_CLEAN_LAUNCHER
+
+		exeinto /usr/libexec/kineticwe
+		doexe "${T}/startplasma-wayland-kineticwe-clean"
+
+		cat > "${T}/plasma-kineticwe-clean.desktop" <<'EOF'
+[Desktop Entry]
+Name=Plasma (KineticWE sanitized)
+Comment=Plasma with KineticWE private runtime removed
+Exec=/usr/libexec/kineticwe/startplasma-wayland-kineticwe-clean
+Type=Application
+DesktopNames=KDE
+EOF
+
+		insinto /usr/share/wayland-sessions
+		doins "${T}/plasma-kineticwe-clean.desktop"
+	fi
+
 	dodoc README.md CONTRIBUTING.md || true
 }
 
@@ -519,6 +594,11 @@ pkg_postinst() {
 	elog "A Wayland session entry was installed at /usr/share/wayland-sessions/kineticwe.desktop."
 	elog "This package includes a private live KDecoration runtime under ${PREFIX}; the system KDecoration package is unchanged."
 	elog "This package starts KineticWE and attempts to launch Noctalia plus required KDE user services."
+	if use plasma-clean-env; then
+		elog "Installed the Plasma (KineticWE sanitized) session entry."
+		elog "Use it when returning to stock Plasma after KineticWE so /opt/kineticwe"
+		elog "runtime search paths are removed before stock KWin/Qt starts."
+	fi
 	elog "If dependency resolution fails, you probably need newer Qt/KF/Plasma packages, likely ~amd64 or the KDE overlay."
 }
 
